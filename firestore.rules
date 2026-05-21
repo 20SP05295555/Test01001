@@ -1,0 +1,71 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Global Safety Net (Default-Deny Catch-All)
+    // ===============================================================
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // ===============================================================
+    // Helper Functions
+    // ===============================================================
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isVerifiedUser() {
+      return isAuthenticated() && 
+        (request.auth.token.email_verified == true || 
+         request.auth.token.firebase.sign_in_provider == 'google.com');
+    }
+
+    function isAdmin() {
+      return isAuthenticated() &&
+        ((exists(/databases/$(database)/documents/users/$(request.auth.uid)) &&
+          get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin') ||
+         (request.auth.token.email == "arponchakrabortty@gmail.com" && request.auth.token.email_verified == true));
+    }
+
+    function isValidId(id) {
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function isValidBusiness(data) {
+      return data.keys().hasAll(['id', 'name', 'website', 'phone', 'rating', 'reviewCount', 'category', 'location', 'hasWhatsApp', 'whatsAppStatus', 'createdAt']) &&
+             data.id is string && data.id.size() <= 128 &&
+             data.name is string && data.name.size() > 0 && data.name.size() < 200 &&
+             data.website is string && data.website.size() > 0 && data.website.size() < 1000 &&
+             data.phone is string && data.phone.size() > 0 && data.phone.size() < 40 &&
+             data.rating is number && data.rating >= 0 && data.rating <= 5 &&
+             data.reviewCount is int && data.reviewCount >= 0 &&
+             data.category is string && data.category.size() > 0 && data.category.size() < 100 &&
+             data.location is string && data.location.size() > 0 && data.location.size() < 150 &&
+             data.hasWhatsApp is bool &&
+             data.whatsAppStatus is string && data.whatsAppStatus.size() < 500 &&
+             data.createdAt is string && data.createdAt.size() < 100 &&
+             (!data.keys().contains('whatsAppProfileName') || (data.whatsAppProfileName is string && data.whatsAppProfileName.size() < 200)) &&
+             (!data.keys().contains('whatsAppProfilePic') || (data.whatsAppProfilePic == null || (data.whatsAppProfilePic is string && data.whatsAppProfilePic.size() < 2083)));
+    }
+
+    // ===============================================================
+    // Collection matches
+    // ===============================================================
+    match /businesses/{businessId} {
+      allow read: if isVerifiedUser();
+      allow create: if isVerifiedUser() && isValidId(businessId) && isValidBusiness(request.resource.data);
+      allow update: if isVerifiedUser() && isValidId(businessId) && isValidBusiness(request.resource.data) &&
+                     request.resource.data.id == resource.data.id &&
+                     request.resource.data.createdAt == resource.data.createdAt &&
+                     request.resource.data.category == resource.data.category &&
+                     request.resource.data.location == resource.data.location;
+      allow delete: if isAdmin();
+    }
+
+    match /users/{userId} {
+      allow read: if isVerifiedUser() && (request.auth.uid == userId || isAdmin());
+      allow write: if isAdmin();
+    }
+  }
+}
