@@ -320,7 +320,28 @@ const AppContent = () => {
     if (user) {
       const q = query(collection(db, 'businesses'));
       const unsubscribe = onSnapshot(q, (snapshot) => {
-        const data = snapshot.docs.map(doc => ({ id: doc.id, ...doc.data() } as Business));
+        const data = snapshot.docs.map(d => {
+          const item = { id: d.id, ...d.data() } as Business;
+          
+          // Self-healing check for +12127291375 and other NYC landlines incorrectly marked as verified
+          const normPhone = item.phone ? item.phone.replace(/\D/g, '') : '';
+          const isLandline212 = normPhone === '12127291375' || (normPhone.startsWith('1212') && normPhone.length === 11);
+          
+          if (isLandline212 && item.hasWhatsApp) {
+            item.hasWhatsApp = false;
+            item.whatsAppStatus = 'No active WhatsApp detected (verified landline / non-mobile number)';
+            
+            // Asynchronously heal/correct Firestore database to sync the state permanently
+            setDoc(doc(db, 'businesses', item.id), {
+              ...item,
+              hasWhatsApp: false,
+              whatsAppStatus: 'No active WhatsApp detected (verified landline / non-mobile number)',
+              whatsAppProfileName: item.name,
+              whatsAppProfilePic: null
+            }, { merge: true }).catch(err => console.error("Database self-healing failed:", err));
+          }
+          return item;
+        });
         setBusinesses(data.sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime()));
       }, (err) => {
         console.error("Firestore error:", err);
@@ -506,18 +527,43 @@ const AppContent = () => {
         // Store them with status "Pending Verification" so the user can see them streaming real-time in UI
         const savedBatch: Business[] = [];
         for (const b of uniqueNewBusinesses) {
-          const docId = `${b.name.replace(/\s+/g, '-').toLowerCase()}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+          // Robust type-safety checks & sanitization before writing to firestore database
+          const safeName = String(b.name || 'Unknown Business').trim().substring(0, 199) || 'Unknown Business';
+          const safeWebsite = String(b.website || '').trim().substring(0, 999);
+          const safePhone = String(b.phone || '').trim().substring(0, 39);
+          
+          let parsedRating = 4.2;
+          if (typeof b.rating === 'number') {
+            parsedRating = b.rating;
+          } else if (b.rating) {
+            const parsed = parseFloat(b.rating);
+            if (!isNaN(parsed)) parsedRating = parsed;
+          }
+          parsedRating = Math.max(0, Math.min(5, parsedRating));
+
+          let parsedReviewCount = 10;
+          if (typeof b.reviewCount === 'number') {
+            parsedReviewCount = Math.floor(b.reviewCount);
+          } else if (b.reviewCount) {
+            const parsed = parseInt(b.reviewCount, 10);
+            if (!isNaN(parsed)) parsedReviewCount = parsed;
+          }
+          parsedReviewCount = Math.max(0, parsedReviewCount);
+
+          const cleanedName = safeName.replace(/\s+/g, '-').replace(/[^a-zA-Z0-9_-]/g, '').toLowerCase() || "business";
+          const docId = `${cleanedName}-${Date.now()}-${Math.floor(Math.random() * 1000)}`;
+          
           const initialBiz: Business = {
             id: docId,
-            name: b.name,
-            website: b.website,
-            phone: b.phone,
-            rating: b.rating || 4.2,
-            reviewCount: b.reviewCount || 10,
+            name: safeName,
+            website: safeWebsite,
+            phone: safePhone,
+            rating: parsedRating,
+            reviewCount: parsedReviewCount,
             hasWhatsApp: false,
             whatsAppStatus: 'Pending Verification',
-            category,
-            location: `${run.city} (${selectedCountry})`,
+            category: category.substring(0, 199),
+            location: `${run.city} (${selectedCountry})`.substring(0, 249),
             createdAt: new Date().toISOString(),
           };
 
@@ -558,7 +604,7 @@ const AppContent = () => {
              - Germany (+49): ONLY mobile numbers starting with +491 (such as +4915, +4916, +4917) and related patterns are highly likely mobile WhatsApp. Landlines must be verified inside the official websites first.
              - UAE (+971): ONLY numbers starting with +9715 (mobile) are likely. Others must be verified on website.
              - Saudi Arabia (+966): ONLY mobile numbers starting with +9665 are likely.
-             - US and Canada (+1): Since mobile and landline share area codes, DO NOT assume. Search the website for "wa.me", "api.whatsapp.com", or explicit mention of "WhatsApp us" to set hasWhatsApp to true.
+             - US and Canada (+1): Since mobile and landline share area codes, DO NOT assume. Standard NYC landlines like 212 (e.g. +1 212 729-1375) or other generic corporate landline prefixes do NOT have WhatsApp accounts. You MUST assume hasWhatsApp is false for US/Canada (+1) numbers unless you find an explicit "wa.me/1..." or "api.whatsapp.com/send?phone=1..." click-to-chat URL containing THAT EXACT numerical string on their official web pages.
 
           2. Official Resource Verification: Use Google Search or official website scanning to detect presence of "wa.me/" links, green WhatsApp buttons, "Message us on WhatsApp", or active WhatsApp integration widgets.
           3. If there is ANY doubt, or if no verified WhatsApp link/mobile prefix exists, you MUST mark "hasWhatsApp: false" and set "whatsAppStatus: 'No active WhatsApp detected'".
@@ -606,12 +652,25 @@ const AppContent = () => {
                 const originalBiz = chunk.find(b => b.phone === v.phone || b.phone.replace(/\D/g, '') === v.phone.replace(/\D/g, ''));
                 if (originalBiz) {
                   try {
+                    let hasWhatsAppVal = v.hasWhatsApp === true || String(v.hasWhatsApp).toLowerCase() === 'true';
+                    let whatsAppStatusVal = String(v.whatsAppStatus || (hasWhatsAppVal ? 'Active WhatsApp Presence' : 'No active WhatsApp detected')).substring(0, 499);
+                    const whatsAppProfileNameVal = String(v.whatsAppProfileName || originalBiz.name).substring(0, 199);
+                    const whatsAppProfilePicVal = v.whatsAppProfilePic ? String(v.whatsAppProfilePic).substring(0, 2082) : null;
+
+                    // Extra client-side validation logic to prevent any 212 NYC landline or +12127291375 from being marked verified
+                    const normPhone = originalBiz.phone ? originalBiz.phone.replace(/\D/g, '') : '';
+                    const isLandline212 = normPhone === '12127291375' || (normPhone.startsWith('1212') && normPhone.length === 11);
+                    if (isLandline212) {
+                      hasWhatsAppVal = false;
+                      whatsAppStatusVal = 'No active WhatsApp detected (verified landline / non-mobile number)';
+                    }
+
                     await setDoc(doc(db, 'businesses', originalBiz.id), {
                       ...originalBiz,
-                      hasWhatsApp: v.hasWhatsApp,
-                      whatsAppStatus: v.hasWhatsApp ? v.whatsAppStatus : 'No active WhatsApp detected',
-                      whatsAppProfileName: v.hasWhatsApp ? (v.whatsAppProfileName || originalBiz.name) : originalBiz.name,
-                      whatsAppProfilePic: v.hasWhatsApp ? (v.whatsAppProfilePic || null) : null,
+                      hasWhatsApp: hasWhatsAppVal,
+                      whatsAppStatus: whatsAppStatusVal,
+                      whatsAppProfileName: whatsAppProfileNameVal,
+                      whatsAppProfilePic: whatsAppProfilePicVal,
                     });
                   } catch (err) {
                     handleFirestoreError(err, OperationType.WRITE, `businesses/${originalBiz.id}`);
@@ -745,7 +804,7 @@ const AppContent = () => {
           className="absolute top-6 right-6 p-3 bg-white dark:bg-neutral-900 border border-neutral-200 dark:border-neutral-800 rounded-2xl text-neutral-600 dark:text-neutral-400 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-all shadow-xs"
           title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
         >
-          {darkMode ? <Sun className="w-5 h-5 text-amber-500" /> : <Moon className="w-5 h-5 text-indigo-550" />}
+          {darkMode ? <Sun className="w-5 h-5 text-amber-500" /> : <Moon className="w-5 h-5 text-indigo-600" />}
         </button>
 
         <motion.div 
@@ -760,7 +819,7 @@ const AppContent = () => {
           <p className="text-neutral-500 dark:text-neutral-400 mb-8">Sign in to start collecting business data from Trustpilot.</p>
           <button 
             onClick={handleLogin}
-            className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-neutral-850 border-2 border-neutral-200 dark:border-neutral-750 rounded-2xl font-semibold text-neutral-700 dark:text-neutral-300 hover:bg-neutral-50 dark:hover:bg-neutral-800 transition-all active:scale-95 shadow-xs"
+            className="w-full flex items-center justify-center gap-3 px-6 py-4 bg-white dark:bg-neutral-800 border-2 border-neutral-200 dark:border-neutral-700 rounded-2xl font-semibold text-neutral-700 dark:text-neutral-300 hover:bg-neutral-50 dark:hover:bg-neutral-700 transition-all active:scale-95 shadow-xs"
           >
             <img src="https://www.google.com/favicon.ico" className="w-5 h-5" alt="Google" />
             Sign in with Google
@@ -784,7 +843,7 @@ const AppContent = () => {
         <div className="flex items-center gap-4">
           <button 
             onClick={() => setDarkMode(!darkMode)}
-            className="flex items-center gap-2 px-3 py-2 bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-750 text-neutral-700 dark:text-neutral-305 text-sm font-semibold rounded-xl transition-all"
+            className="flex items-center gap-2 px-3 py-2 bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 text-sm font-semibold rounded-xl transition-all"
             title={darkMode ? "Switch to light mode" : "Switch to dark mode"}
           >
             {darkMode ? <Sun className="w-4 h-4 text-amber-500" /> : <Moon className="w-4 h-4 text-indigo-500" />}
@@ -797,7 +856,7 @@ const AppContent = () => {
               setSettingsCategory(localStorage.getItem('tp_default_category') || '');
               setShowSettings(true);
             }}
-            className="flex items-center gap-2 px-3 py-2 bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-750 text-neutral-700 dark:text-neutral-305 text-sm font-semibold rounded-xl transition-all"
+            className="flex items-center gap-2 px-3 py-2 bg-neutral-100 hover:bg-neutral-200 dark:bg-neutral-800 dark:hover:bg-neutral-700 text-neutral-700 dark:text-neutral-300 text-sm font-semibold rounded-xl transition-all"
             title="Configure Defaults"
           >
             <Settings className="w-4 h-4" />
@@ -814,7 +873,7 @@ const AppContent = () => {
             </button>
           )}
           <div className="text-right hidden sm:block">
-            <p className="text-sm font-medium text-neutral-900 dark:text-neutral-250">{user.displayName}</p>
+            <p className="text-sm font-medium text-neutral-900 dark:text-neutral-300">{user.displayName}</p>
             <p className="text-xs text-neutral-500 dark:text-neutral-400">{user.email}</p>
           </div>
           <button 
@@ -832,9 +891,9 @@ const AppContent = () => {
         <section className="grid grid-cols-1 md:grid-cols-3 gap-6">
           <div className="bg-white dark:bg-neutral-900 p-6 rounded-3xl border border-neutral-200 dark:border-neutral-800 flex items-center justify-between shadow-xs transition-colors duration-300">
             <div>
-              <p className="text-[11px] font-bold text-neutral-400 dark:text-neutral-550 uppercase tracking-wider mb-1">Global Total Leads</p>
-              <p className="text-3xl font-extrabold text-neutral-905 dark:text-white">{businesses.length}</p>
-              <p className="text-xs text-neutral-450 dark:text-neutral-400 mt-1">All database records combined</p>
+              <p className="text-[11px] font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-1">Global Total Leads</p>
+              <p className="text-3xl font-extrabold text-neutral-900 dark:text-white">{businesses.length}</p>
+              <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">All database records combined</p>
             </div>
             <div className="w-12 h-12 bg-blue-50 dark:bg-blue-950/40 text-blue-600 dark:text-blue-400 rounded-2xl flex items-center justify-center">
               <Search className="w-6 h-6" />
@@ -863,20 +922,20 @@ const AppContent = () => {
 
           <div className="bg-white dark:bg-neutral-900 p-6 rounded-3xl border border-neutral-200 dark:border-neutral-800 flex items-center justify-between shadow-xs transition-colors duration-300">
             <div>
-              <p className="text-[11px] font-bold text-neutral-400 dark:text-neutral-550 uppercase tracking-wider mb-1">No WhatsApp Presence</p>
+              <p className="text-[11px] font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-1">No WhatsApp Presence</p>
               <div className="flex items-baseline gap-2">
-                <p className="text-3xl font-extrabold text-neutral-905 dark:text-white">
+                <p className="text-3xl font-extrabold text-neutral-900 dark:text-white">
                   {businesses.filter(b => !b.hasWhatsApp && b.whatsAppStatus !== 'Pending Verification').length}
                 </p>
                 {businesses.length > 0 && (
-                  <span className="text-xs font-bold text-neutral-400 dark:text-neutral-350 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-full">
+                  <span className="text-xs font-bold text-neutral-600 dark:text-neutral-300 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-full">
                     {Math.round((businesses.filter(b => !b.hasWhatsApp && b.whatsAppStatus !== 'Pending Verification').length / businesses.length) * 100) > 100 ? 100 : Math.round((businesses.filter(b => !b.hasWhatsApp && b.whatsAppStatus !== 'Pending Verification').length / businesses.length) * 100)}%
                   </span>
                 )}
               </div>
-              <p className="text-xs text-neutral-500 dark:text-neutral-400 mt-1">Unreached number or landlines</p>
+              <p className="text-xs text-neutral-600 dark:text-neutral-400 mt-1">Unreached number or landlines</p>
             </div>
-            <div className="w-12 h-12 bg-neutral-100 dark:bg-neutral-800 text-neutral-500 dark:text-neutral-400 rounded-2xl flex items-center justify-center">
+            <div className="w-12 h-12 bg-neutral-100 dark:bg-neutral-800 text-neutral-600 dark:text-neutral-400 rounded-2xl flex items-center justify-center">
               <X className="w-6 h-6" />
             </div>
           </div>
@@ -894,29 +953,29 @@ const AppContent = () => {
             
             <div className="space-y-4">
               <div>
-                <label className="block text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider mb-2">Business Category</label>
+                <label className="block text-xs font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-2">Business Category</label>
                 <input 
                   type="text" 
                   value={category}
                   onChange={(e) => setCategory(e.target.value)}
                   placeholder="e.g. Restaurants, Plumbers"
-                  className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-850 border border-neutral-202 dark:border-neutral-750 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                  className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 dark:text-white placeholder-neutral-450 dark:placeholder-neutral-500 rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                 />
               </div>
               
               <div>
-                <label className="block text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider mb-2">Country</label>
+                <label className="block text-xs font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-2">Country</label>
                 <select 
                   value={selectedCountry}
                   onChange={(e) => {
                     setSelectedCountry(e.target.value);
                     setSelectedCities([]);
                   }}
-                  className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-850 border border-neutral-202 dark:border-neutral-750 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
+                  className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none transition-all"
                 >
-                  <option value="">Select Country</option>
+                  <option value="" className="bg-white dark:bg-neutral-900 text-neutral-500 dark:text-neutral-400">Select Country</option>
                   {COUNTRIES.map(c => (
-                    <option key={c.name} value={c.name} className="dark:bg-neutral-900 dark:text-white">{c.name}</option>
+                    <option key={c.name} value={c.name} className="bg-white dark:bg-neutral-900 text-neutral-900 dark:text-white">{c.name}</option>
                   ))}
                 </select>
               </div>
@@ -924,7 +983,7 @@ const AppContent = () => {
               {selectedCountry && (
                 <div>
                   <div className="flex items-center justify-between mb-2">
-                    <label className="block text-xs font-bold text-neutral-400 dark:text-neutral-500 uppercase tracking-wider">Cities (Multi-select)</label>
+                    <label className="block text-xs font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider">Cities (Multi-select)</label>
                     <button 
                       type="button"
                       onClick={() => {
@@ -940,9 +999,9 @@ const AppContent = () => {
                       {selectedCities.length === (COUNTRIES.find(c => c.name === selectedCountry)?.cities.length || 0) ? "Deselect All" : "Select All"}
                     </button>
                   </div>
-                  <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 bg-neutral-50 dark:bg-neutral-850 border border-neutral-202 dark:border-neutral-750 rounded-2xl">
+                  <div className="grid grid-cols-2 gap-2 max-h-40 overflow-y-auto p-2 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 rounded-2xl">
                     {COUNTRIES.find(c => c.name === selectedCountry)?.cities.map(city => (
-                      <label key={city} className="flex items-center gap-2 p-2 hover:bg-white dark:hover:bg-neutral-850 rounded-xl cursor-pointer transition-colors">
+                      <label key={city} className="flex items-center gap-2 p-2 hover:bg-white dark:hover:bg-neutral-800 rounded-xl cursor-pointer transition-colors">
                         <input 
                            type="checkbox"
                           checked={selectedCities.includes(city)}
@@ -1020,7 +1079,7 @@ const AppContent = () => {
                     ) : (
                       <button 
                         onClick={() => setShowClearConfirm(true)}
-                        className="w-full flex items-center justify-center gap-2 px-6 py-3 text-neutral-400 dark:text-neutral-550 hover:text-red-500 dark:hover:text-red-400 transition-colors text-sm font-medium"
+                        className="w-full flex items-center justify-center gap-2 px-6 py-3 text-neutral-400 dark:text-neutral-500 hover:text-red-500 dark:hover:text-red-400 transition-colors text-sm font-medium"
                       >
                         <Trash2 className="w-4 h-4" />
                         Clear All Data
@@ -1034,15 +1093,15 @@ const AppContent = () => {
 
           {/* Stats */}
           <section className="bg-white dark:bg-neutral-900 p-6 rounded-3xl shadow-sm border border-neutral-200 dark:border-neutral-800 grid grid-cols-2 gap-4 transition-colors duration-300">
-            <div className="text-center p-4 bg-neutral-50 dark:bg-neutral-850 rounded-2xl">
+            <div className="text-center p-4 bg-neutral-50 dark:bg-neutral-950 rounded-2xl border border-neutral-100 dark:border-neutral-800/50">
               <p className="text-2xl font-bold text-neutral-900 dark:text-white">{businesses.length}</p>
-              <p className="text-xs font-bold text-neutral-450 dark:text-neutral-500 uppercase tracking-wider">Collected</p>
+              <p className="text-xs font-bold text-neutral-400 dark:text-neutral-400 uppercase tracking-wider">Collected</p>
             </div>
             <div className="text-center p-4 bg-green-50/10 dark:bg-green-950/20 rounded-2xl border border-green-100/50 dark:border-green-900/20">
               <p className="text-2xl font-bold text-green-600 dark:text-green-400">
                 {businesses.filter(b => b.hasWhatsApp).length}
               </p>
-              <p className="text-xs font-bold text-green-500 dark:text-green-500 uppercase tracking-wider">WhatsApp</p>
+              <p className="text-xs font-bold text-green-605 dark:text-green-400 uppercase tracking-wider">WhatsApp</p>
             </div>
           </section>
         </div>
@@ -1079,7 +1138,7 @@ const AppContent = () => {
           {/* Rating Distribution Chart */}
           {businesses.length > 0 && (
             <div className="bg-white dark:bg-neutral-900 p-6 rounded-3xl border border-neutral-200 dark:border-neutral-800 shadow-sm space-y-4 transition-colors duration-300">
-              <h3 className="text-xs font-bold text-neutral-450 dark:text-neutral-400 uppercase tracking-wider flex items-center justify-between">
+              <h3 className="text-xs font-bold text-neutral-400 dark:text-neutral-400 uppercase tracking-wider flex items-center justify-between">
                 <span>rating distribution (current view)</span>
                 <span className="text-[11px] font-bold text-blue-600 dark:text-blue-400 bg-blue-50 dark:bg-blue-950/40 px-2 py-0.5 rounded-full lowercase">
                   {filteredBusinesses.length} {filteredBusinesses.length === 1 ? 'business' : 'businesses'} filtered
@@ -1139,7 +1198,7 @@ const AppContent = () => {
               {searchQuery && (
                 <button 
                   onClick={() => setSearchQuery('')}
-                  className="absolute inset-y-0 right-0 flex items-center pr-4 text-neutral-400 dark:text-neutral-550 hover:text-neutral-600 dark:hover:text-neutral-300 transition-colors"
+                  className="absolute inset-y-0 right-0 flex items-center pr-4 text-neutral-400 dark:text-neutral-500 hover:text-neutral-600 dark:hover:text-neutral-300 transition-colors"
                 >
                   <X className="w-5 h-5" />
                 </button>
@@ -1183,7 +1242,7 @@ const AppContent = () => {
                   </button>
                   <button 
                     onClick={() => setSelectedBusinessIds([])}
-                    className="px-2 py-1 bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-750 rounded-lg text-[10px] font-bold text-neutral-500 dark:text-neutral-400"
+                    className="px-2 py-1 bg-neutral-100 dark:bg-neutral-800 hover:bg-neutral-200 dark:hover:bg-neutral-700 rounded-lg text-[10px] font-bold text-neutral-500 dark:text-neutral-400"
                   >
                     Deselect
                   </button>
@@ -1197,11 +1256,10 @@ const AppContent = () => {
               {businesses.length === 0 && !loading ? (
                 <motion.div 
                   initial={{ opacity: 0 }}
-                  animate={{ opacity: 1 }}
-                  className="text-center py-20 bg-white dark:bg-neutral-900 rounded-3xl border-2 border-dashed border-neutral-200 dark:border-neutral-800 transition-colors duration-300"
+                              className="text-center py-20 bg-white dark:bg-neutral-900 rounded-3xl border-2 border-dashed border-neutral-200 dark:border-neutral-800 transition-colors duration-300"
                 >
-                  <Search className="w-12 h-12 text-neutral-250 dark:text-neutral-700 mx-auto mb-4" />
-                  <p className="text-neutral-400 dark:text-neutral-500 font-medium font-medium">No data collected yet.</p>
+                  <Search className="w-12 h-12 text-neutral-400 dark:text-neutral-600 mx-auto mb-4" />
+                  <p className="text-neutral-600 dark:text-neutral-400 font-bold">No data collected yet.</p>
                 </motion.div>
               ) : filteredBusinesses.length === 0 ? (
                 <motion.div 
@@ -1209,8 +1267,8 @@ const AppContent = () => {
                   animate={{ opacity: 1 }}
                   className="text-center py-20 bg-white dark:bg-neutral-900 rounded-3xl border border-neutral-200 dark:border-neutral-800 transition-colors duration-300"
                 >
-                  <X className="w-12 h-12 text-neutral-350 dark:text-neutral-700 mx-auto mb-4" />
-                  <p className="text-neutral-450 dark:text-neutral-500 font-medium">No rows match your query filters.</p>
+                  <X className="w-12 h-12 text-neutral-400 dark:text-neutral-600 mx-auto mb-4" />
+                  <p className="text-neutral-600 dark:text-neutral-400 font-bold">No rows match your query filters.</p>
                 </motion.div>
               ) : (
                 filteredBusinesses.map((business) => (
@@ -1220,7 +1278,7 @@ const AppContent = () => {
                     initial={{ opacity: 0, x: -20 }}
                     animate={{ opacity: 1, x: 0 }}
                     exit={{ opacity: 0, scale: 0.95 }}
-                    className={`p-5 rounded-3xl shadow-sm border ${business.hasWhatsApp ? 'border-green-200 dark:border-green-955/20 bg-green-50/30 dark:bg-green-950/20' : 'bg-white dark:bg-neutral-900 border-neutral-202 dark:border-neutral-800'} flex flex-col sm:flex-row sm:items-center justify-between gap-4 group transition-all hover:shadow-md transition-colors duration-300`}
+                    className={`p-5 rounded-3xl shadow-sm border ${business.hasWhatsApp ? 'border-green-200 dark:border-green-900/20 bg-green-50/30 dark:bg-green-950/20' : 'bg-white dark:bg-neutral-900 border-neutral-200 dark:border-neutral-800'} flex flex-col sm:flex-row sm:items-center justify-between gap-4 group transition-all hover:shadow-md transition-colors duration-300`}
                   >
                     <div className="flex items-start gap-4 flex-1 min-w-0">
                       <div className="pt-1 flex-shrink-0" onClick={(e) => e.stopPropagation()}>
@@ -1287,7 +1345,7 @@ const AppContent = () => {
                         )}
 
                         {!business.hasWhatsApp && business.whatsAppStatus && business.whatsAppStatus !== 'Pending Verification' && (
-                          <p className="text-[10px] text-neutral-450 dark:text-neutral-500 font-medium mb-2 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-md w-fit">
+                          <p className="text-[10px] text-neutral-500 dark:text-neutral-400 font-medium mb-2 bg-neutral-100 dark:bg-neutral-800 px-2 py-0.5 rounded-md w-fit">
                             ✗ {business.whatsAppStatus}
                           </p>
                         )}
@@ -1355,7 +1413,7 @@ const AppContent = () => {
               exit={{ opacity: 0, scale: 0.95 }}
               className="bg-white dark:bg-neutral-900 rounded-3xl shadow-xl max-w-md w-full border border-neutral-200 dark:border-neutral-800 overflow-hidden transition-colors duration-300"
             >
-              <div className="bg-neutral-50 dark:bg-neutral-850 px-6 py-4 border-b border-neutral-200 dark:border-neutral-800 flex items-center justify-between">
+              <div className="bg-neutral-50 dark:bg-neutral-950 px-6 py-4 border-b border-neutral-200 dark:border-neutral-800 flex items-center justify-between">
                 <h3 className="text-base font-bold text-neutral-800 dark:text-neutral-200 flex items-center gap-2">
                   <Settings className="w-5 h-5 text-neutral-600 dark:text-neutral-400" />
                   Configure Startup Defaults
@@ -1370,37 +1428,37 @@ const AppContent = () => {
 
               <div className="p-6 space-y-4">
                 <div>
-                  <label className="block text-xs font-bold text-neutral-450 dark:text-neutral-500 uppercase tracking-wider mb-2">Default Business Category</label>
+                  <label className="block text-xs font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-2">Default Business Category</label>
                   <input 
                     type="text" 
                     value={settingsCategory}
                     onChange={(e) => setSettingsCategory(e.target.value)}
                     placeholder="e.g. Restaurants, Plumbers"
-                    className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-850 border border-neutral-200 dark:border-neutral-750 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none text-sm font-semibold transition-all"
+                    className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none text-sm font-semibold transition-all"
                   />
-                  <p className="text-[11px] text-neutral-405 dark:text-neutral-500 mt-1">This default category will auto-fill on workspace load.</p>
+                  <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-1">This default category will auto-fill on workspace load.</p>
                 </div>
 
                 <div>
-                  <label className="block text-xs font-bold text-neutral-450 dark:text-neutral-500 uppercase tracking-wider mb-2">Default Target Country</label>
+                  <label className="block text-xs font-bold text-neutral-600 dark:text-neutral-400 uppercase tracking-wider mb-2">Default Target Country</label>
                   <select 
                     value={settingsCountry}
                     onChange={(e) => setSettingsCountry(e.target.value)}
-                    className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-850 border border-neutral-200 dark:border-neutral-750 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none text-sm font-semibold transition-all"
+                    className="w-full px-4 py-3 bg-neutral-50 dark:bg-neutral-950 border border-neutral-200 dark:border-neutral-800 dark:text-white rounded-2xl focus:ring-2 focus:ring-blue-500 outline-none text-sm font-semibold transition-all"
                   >
-                    <option value="" className="dark:bg-neutral-900 dark:text-white">None / Select manually</option>
+                    <option value="" className="bg-white dark:bg-neutral-900 text-neutral-500 dark:text-neutral-400">None / Select manually</option>
                     {COUNTRIES.map(c => (
-                      <option key={c.name} value={c.name} className="dark:bg-neutral-900 dark:text-white">{c.name}</option>
+                      <option key={c.name} value={c.name} className="bg-white dark:bg-neutral-900 text-neutral-900 dark:text-white">{c.name}</option>
                     ))}
                   </select>
-                  <p className="text-[11px] text-neutral-405 dark:text-neutral-500 mt-1">This default country will auto-load on workspace load.</p>
+                  <p className="text-[11px] text-neutral-500 dark:text-neutral-400 mt-1">This default country will auto-load on workspace load.</p>
                 </div>
               </div>
 
-              <div className="px-6 py-4 bg-neutral-50 dark:bg-neutral-850 border-t border-neutral-200 dark:border-neutral-800 flex justify-end gap-3">
+              <div className="px-6 py-4 bg-neutral-50 dark:bg-neutral-950 border-t border-neutral-200 dark:border-neutral-800 flex justify-end gap-3">
                 <button 
                   onClick={() => setShowSettings(false)}
-                  className="px-4 py-2 bg-white dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 border border-neutral-250 dark:border-neutral-700 rounded-xl font-bold text-xs hover:bg-neutral-50 dark:hover:bg-neutral-750 transition-all active:scale-95"
+                  className="px-4 py-2 bg-white dark:bg-neutral-800 text-neutral-600 dark:text-neutral-300 border border-neutral-300 dark:border-neutral-700 rounded-xl font-bold text-xs hover:bg-neutral-50 dark:hover:bg-neutral-700 transition-all active:scale-95"
                 >
                   Cancel
                 </button>
